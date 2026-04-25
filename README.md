@@ -150,7 +150,6 @@ In April 2026, Morocco's FM6SS opened a Precision Medicine Hub in Rabat. The seq
 First-year medical student, Faculty of Medicine and Pharmacy of Casablanca (FMPC)
 
 ---
-
 ## References
 
 - Moroccan Genome Project: [EGA EGAD50000000750](https://ega-archive.org/datasets/EGAD50000000750)
@@ -158,3 +157,4 @@ First-year medical student, Faculty of Medicine and Pharmacy of Casablanca (FMPC
 - H3Africa: [h3africa.org](https://h3africa.org)
 - EGP1K: [bioRxiv 2026.04.02.715521](https://www.biorxiv.org/content/10.64898/2026.04.02.715521v1)
 - FM6SS Hub: [Morocco World News, April 2026](https://www.moroccoworldnews.com/2026/04/286002/fm6ss-launches-advanced-hub-to-integrate-genomics-patient-care-in-rabat/)
+

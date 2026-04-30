@@ -144,7 +144,7 @@ def extract_flanks_from_vcf(vcf_path, ref, split=None, max_variants=None):
 
     print(f"Extracted {count} sequences. Skipped {skipped} variants.")
 
-# ── Test Run ──────────────────────────────────────────────────────────────────
+# ── Test Run (IT WORKED FIRST TIME!!!!)  ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     VCF_PATH = "data/raw/1000genomes/1kGP_high_coverage_Illumina.chr22.filtered.SNV_INDEL_SV_phased_panel.vcf.gz"

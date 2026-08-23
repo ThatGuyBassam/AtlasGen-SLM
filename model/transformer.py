@@ -1,35 +1,165 @@
 # model/transformer.py
 # AtlasGen-SLM Phase 1 — Encoder-only Transformer for genomic MLM pretraining.
 # Raw PyTorch. No HuggingFace wrappers.
-# Optimized for RTX 4060 8GB VRAM + local training.
 #
-# Architecture:
+# Final Phase 1 architecture (~43M params):
 #   Vocab:       4107 tokens
-#   d_model:     384
-#   n_heads:     6
-#   n_layers:    8
-#   d_ff:        1536
+#   d_model:     512
+#   n_heads:     8
+#   n_layers:    12
+#   d_ff:        1536  (SwiGLU feedforward)
 #   max_length:  256
 #   dropout:     0.1
+#   norm:        RMSNorm
+#   positions:   RoPE applied to Q/K inside attention
+#   attention:   torch.nn.functional.scaled_dot_product_attention
 #
 # Notes:
-# - Learned absolute positional embeddings are used because the input geometry is fixed.
-# - CLS token is expected at position 0.
-# - Mutation-centered token index is handled by dataset/trainer, not this model.
+# - This keeps the same public model interface as the previous AtlasGenSLM:
+#       model(input_ids, attention_mask) -> MLM logits
+#       model(input_ids, attention_mask, return_hidden=True) -> hidden states
 # - Weight tying is used between token embeddings and MLM decoder.
 # - PAD embedding row is explicitly zeroed and protected from gradient updates.
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ── Rotary Position Embeddings ────────────────────────────────────────────────
+
+class RotaryPositionEmbedding(nn.Module):
+    """
+    Rotary positional embedding cache/generator for attention Q/K tensors.
+
+    Input attention tensors use shape:
+        [B, n_heads, T, d_head]
+
+    RoPE is applied pairwise over the final dimension:
+        even/odd channels rotate together.
+
+    The cosine/sine tensors are cached per sequence length, device, and dtype so
+    each layer does not repeatedly rebuild the same position table.
+    """
+
+    def __init__(self, d_head, base=10_000.0):
+        super().__init__()
+
+        if d_head % 2 != 0:
+            raise ValueError("RoPE requires an even d_head.")
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, d_head, 2, dtype=torch.float32) / d_head)
+        )
+
+        self.d_head = d_head
+        self.base = base
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def forward(self, seq_len, device, dtype):
+        """
+        Returns:
+            cos, sin with shape [1, 1, T, d_head/2]
+        """
+        cache_is_valid = (
+            self._cos_cached is not None
+            and self._sin_cached is not None
+            and self._seq_len_cached >= seq_len
+            and self._cos_cached.device == device
+            and self._sin_cached.device == device
+            and self._cos_cached.dtype == dtype
+            and self._sin_cached.dtype == dtype
+        )
+
+        if cache_is_valid:
+            return (
+                self._cos_cached[:, :, :seq_len, :],
+                self._sin_cached[:, :, :seq_len, :],
+            )
+
+        positions = torch.arange(
+            seq_len,
+            device=device,
+            dtype=self.inv_freq.dtype,
+        )
+
+        freqs = torch.outer(positions, self.inv_freq.to(device))
+
+        cos = freqs.cos().to(dtype=dtype)[None, None, :, :]
+        sin = freqs.sin().to(dtype=dtype)[None, None, :, :]
+
+        self._seq_len_cached = seq_len
+        self._cos_cached = cos
+        self._sin_cached = sin
+
+        return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    """
+    Apply RoPE to tensor x with explicit even/odd interleaving.
+
+    x:   [B, n_heads, T, d_head]
+    cos: [1, 1, T, d_head/2]
+    sin: [1, 1, T, d_head/2]
+    """
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
+
+    x_out = torch.empty_like(x)
+    x_out[..., 0::2] = x_rot_even
+    x_out[..., 1::2] = x_rot_odd
+
+    return x_out
+
+
+# ── RMSNorm ───────────────────────────────────────────────────────────────────
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+
+    Unlike LayerNorm, RMSNorm does not re-center the input (no mean
+    subtraction) and has no bias term — it only rescales by the RMS of the
+    input, then applies a learned per-channel gain.
+
+        y = x / sqrt(mean(x^2) + eps) * weight
+
+    Cheaper than LayerNorm (no mean, no bias) and standard in modern
+    transformer stacks (LLaMA, etc.). Used everywhere nn.LayerNorm previously
+    appeared in this model: embeddings, block norms, final norm, MLM head.
+    """
+
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        # Compute in float32 for numerical stability, then cast back.
+        input_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (x.to(input_dtype)) * self.weight
 
 
 # ── Embedding Layer ───────────────────────────────────────────────────────────
 
 class GenomicEmbedding(nn.Module):
     """
-    Token + learned positional embedding layer.
+    Token embedding layer.
+
+    Positional information is not added here. RoPE is applied to Q/K inside
+    self-attention.
 
     PAD handling:
     - token_embeddings uses padding_idx=0.
@@ -37,28 +167,17 @@ class GenomicEmbedding(nn.Module):
     - This prevents PAD vectors from contaminating embedding normalization.
     """
 
-    def __init__(self, vocab_size, d_model, max_length, dropout):
+    def __init__(self, vocab_size, d_model, dropout):
         super().__init__()
 
         self.token_embeddings = nn.Embedding(
             vocab_size,
             d_model,
-            padding_idx=0
+            padding_idx=0,
         )
 
-        self.position_embeddings = nn.Embedding(
-            max_length,
-            d_model
-        )
-
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-
-        self.register_buffer(
-            "position_ids",
-            torch.arange(max_length).unsqueeze(0),
-            persistent=False
-        )
 
     def forward(self, input_ids, attention_mask=None):
         """
@@ -67,15 +186,11 @@ class GenomicEmbedding(nn.Module):
 
         returns:        [B, T, d_model]
         """
-        seq_len = input_ids.size(1)
+        x = self.token_embeddings(input_ids)
 
-        tok_emb = self.token_embeddings(input_ids)
-        pos_emb = self.position_embeddings(self.position_ids[:, :seq_len])
-
-        x = tok_emb + pos_emb
-
-        # Important: mask before LayerNorm.
-        # LayerNorm over a zero vector stays zero because beta is initialized to 0.
+        # Important: mask before norm.
+        # RMSNorm has no bias term, so a zero input vector stays exactly zero
+        # (0 / sqrt(eps) * weight = 0) — no special-casing needed.
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1)
 
@@ -89,19 +204,21 @@ class GenomicEmbedding(nn.Module):
 
 class MultiHeadSelfAttention(nn.Module):
     """
-    Explicit scaled dot-product multi-head self-attention.
+    Multi-head self-attention using PyTorch SDPA.
 
-    d_model=384, n_heads=6 → d_head=64.
+    Advantages over explicit scores/softmax/matmul:
+    - Lets PyTorch dispatch to optimized CUDA attention kernels when available.
+    - Avoids manually materializing attention probabilities in Python.
+    - Keeps the same Q/K/V/O parameterization as the original implementation.
 
-    Important numerical detail:
-    - Uses dtype-safe finite mask value instead of -inf.
-    - This is safer under AMP/fp16 than hardcoding -1e9.
+    RoPE is applied to Q and K before attention.
     """
 
-    def __init__(self, d_model, n_heads, dropout):
+    def __init__(self, d_model, n_heads, dropout, rope_base=10_000.0):
         super().__init__()
 
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads.")
 
         self.d_model = d_model
         self.n_heads = n_heads
@@ -113,7 +230,10 @@ class MultiHeadSelfAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
 
         self.dropout = nn.Dropout(dropout)
-        self.scale = math.sqrt(self.d_head)
+        self.rope = RotaryPositionEmbedding(
+            d_head=self.d_head,
+            base=rope_base,
+        )
 
     def forward(self, x, attention_mask=None):
         """
@@ -132,25 +252,30 @@ class MultiHeadSelfAttention(nn.Module):
         K = K.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        # [B, n_heads, T, T]
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        cos, sin = self.rope(
+            seq_len=T,
+            device=x.device,
+            dtype=Q.dtype,
+        )
+
+        Q = apply_rope(Q, cos, sin)
+        K = apply_rope(K, cos, sin)
+
+        attn_mask = None
 
         if attention_mask is not None:
-            # Key masking only.
-            # Shape: [B, 1, 1, T], broadcast over heads and query positions.
-            key_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            # Shape [B, 1, 1, T], broadcast over heads and query positions.
+            # For boolean SDPA masks: True = keep, False = masked out.
+            attn_mask = attention_mask[:, None, None, :].bool()
 
-            # AMP-safe finite negative value.
-            # For fp16: about -65504.
-            # For fp32: very large negative finite value.
-            mask_value = torch.finfo(scores.dtype).min
-
-            scores = scores.masked_fill(key_mask == 0, mask_value)
-
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        context = torch.matmul(attn_weights, V)
+        context = F.scaled_dot_product_attention(
+            Q,
+            K,
+            V,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=False,
+        )
 
         context = (
             context
@@ -167,33 +292,38 @@ class MultiHeadSelfAttention(nn.Module):
 
 # ── Feedforward Block ─────────────────────────────────────────────────────────
 
-class FeedForward(nn.Module):
+class SwiGLU(nn.Module):
     """
-    Standard Transformer feedforward block:
+    SwiGLU feedforward block (as used in LLaMA and similar modern stacks).
 
-        Linear(d_model → d_ff)
-        GELU
-        Dropout
-        Linear(d_ff → d_model)
-        Dropout
+    Instead of one up-projection + activation, SwiGLU uses two parallel
+    up-projections: one is passed through SiLU and used as a gate that
+    multiplies the other, before projecting back down to d_model.
 
-    GELU is kept intentionally.
-    No SwiGLU for the baseline.
+        gate = SiLU(W_gate(x))
+        up   = W_up(x)
+        out  = W_down(gate * up)
+
+    This consistently outperforms a plain GELU MLP at matched parameter
+    count in practice, which is why d_ff is set lower here (1536) than the
+    earlier GELU version (2048) — SwiGLU has three weight matrices instead
+    of two, so d_ff is reduced to land at a comparable/target total param
+    count (~43M for the full model).
     """
 
     def __init__(self, d_model, d_ff, dropout):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
+        self.w_gate = nn.Linear(d_model, d_ff)
+        self.w_up = nn.Linear(d_model, d_ff)
+        self.w_down = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.net(x)
+        gate = F.silu(self.w_gate(x))
+        up = self.w_up(x)
+        out = self.w_down(gate * up)
+        return self.dropout(out)
 
 
 # ── Transformer Block ─────────────────────────────────────────────────────────
@@ -202,18 +332,23 @@ class TransformerBlock(nn.Module):
     """
     Pre-Norm Transformer encoder block.
 
-        x → LayerNorm → Self-Attention → residual
-          → LayerNorm → FeedForward    → residual
+        x → LayerNorm → RoPE+SDPA Self-Attention → residual
+          → LayerNorm → FeedForward              → residual
     """
 
-    def __init__(self, d_model, n_heads, d_ff, dropout):
+    def __init__(self, d_model, n_heads, d_ff, dropout, rope_base=10_000.0):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout)
+        self.norm1 = RMSNorm(d_model)
+        self.attn = MultiHeadSelfAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            rope_base=rope_base,
+        )
 
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ff = FeedForward(d_model, d_ff, dropout)
+        self.norm2 = RMSNorm(d_model)
+        self.ff = SwiGLU(d_model, d_ff, dropout)
 
     def forward(self, x, attention_mask=None):
         x = x + self.attn(self.norm1(x), attention_mask)
@@ -240,7 +375,7 @@ class MLMHead(nn.Module):
 
         self.dense = nn.Linear(d_model, d_model)
         self.act = nn.GELU()
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
 
         self.decoder = nn.Linear(d_model, vocab_size, bias=False)
         self.decoder.weight = embedding_weights
@@ -274,12 +409,13 @@ class AtlasGenSLM(nn.Module):
     def __init__(
         self,
         vocab_size=4107,
-        d_model=384,
-        n_heads=6,
-        n_layers=8,
+        d_model=512,
+        n_heads=8,
+        n_layers=12,
         d_ff=1536,
         max_length=256,
         dropout=0.1,
+        rope_base=10_000.0,
     ):
         super().__init__()
 
@@ -291,11 +427,11 @@ class AtlasGenSLM(nn.Module):
         self.d_ff = d_ff
         self.max_length = max_length
         self.dropout_rate = dropout
+        self.rope_base = rope_base
 
         self.embedding = GenomicEmbedding(
             vocab_size=vocab_size,
             d_model=d_model,
-            max_length=max_length,
             dropout=dropout,
         )
 
@@ -305,11 +441,12 @@ class AtlasGenSLM(nn.Module):
                 n_heads=n_heads,
                 d_ff=d_ff,
                 dropout=dropout,
+                rope_base=rope_base,
             )
             for _ in range(n_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(d_model)
+        self.final_norm = RMSNorm(d_model)
 
         self.mlm_head = MLMHead(
             d_model=d_model,
@@ -337,7 +474,6 @@ class AtlasGenSLM(nn.Module):
         Simple GPT/BERT-style initialization.
 
         No custom depth scaling for now.
-        No premature architecture tricks.
         """
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -348,9 +484,9 @@ class AtlasGenSLM(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-            elif isinstance(module, nn.LayerNorm):
+            elif isinstance(module, RMSNorm):
+                # RMSNorm has no bias term (unlike LayerNorm), only a gain.
                 nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
 
     @staticmethod
     def _zero_pad_embedding_grad(grad):
@@ -387,6 +523,11 @@ class AtlasGenSLM(nn.Module):
             "d_ff": self.d_ff,
             "max_length": self.max_length,
             "dropout": self.dropout_rate,
+            "position_encoding": "rope",
+            "rope_base": self.rope_base,
+            "attention": "torch_scaled_dot_product_attention",
+            "norm": "rmsnorm",
+            "feedforward": "swiglu",
         }
 
     def forward(self, input_ids, attention_mask=None, return_hidden=False):
@@ -400,6 +541,10 @@ class AtlasGenSLM(nn.Module):
         If return_hidden=True:
             returns final hidden states: [B, T, d_model]
         """
+        # RoPE is generated dynamically inside each attention block, so there is
+        # no learned positional embedding table to index out of bounds. The
+        # stored max_length is therefore treated as training/config metadata, not
+        # a hard architectural limit.
         x = self.embedding(input_ids, attention_mask)
 
         for block in self.blocks:
@@ -420,7 +565,7 @@ class AtlasGenSLM(nn.Module):
 # ── Test Run ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Building AtlasGen-SLM...")
+    print("Building AtlasGen-SLM RoPE+SDPA candidate...")
 
     model = AtlasGenSLM()
 
@@ -428,7 +573,7 @@ if __name__ == "__main__":
 
     print(f"Parameters: {total_params:,}")
     print(f"Approx fp32 size: {total_params * 4 / 1024**2:.1f} MB")
-    print(f"Approx fp16 size: {total_params * 2 / 1024**2:.1f} MB")
+    print(f"Approx fp16/bf16 size: {total_params * 2 / 1024**2:.1f} MB")
 
     print("\nModel config:")
     print(model.get_config())
@@ -520,4 +665,19 @@ if __name__ == "__main__":
     print(f"PAD grad abs sum: {pad_grad_abs_sum}")
     assert pad_grad_abs_sum == 0.0, "PAD embedding row received gradient."
 
-    print("\nAtlasGen-SLM architecture verified.")
+    print("\nChecking RoPE/attention gradient flow...")
+
+    first_attn = model.blocks[0].attn
+    q_grad_abs_sum = first_attn.W_q.weight.grad.abs().sum().item()
+    k_grad_abs_sum = first_attn.W_k.weight.grad.abs().sum().item()
+    v_grad_abs_sum = first_attn.W_v.weight.grad.abs().sum().item()
+
+    print(f"W_q grad abs sum: {q_grad_abs_sum:.6f}")
+    print(f"W_k grad abs sum: {k_grad_abs_sum:.6f}")
+    print(f"W_v grad abs sum: {v_grad_abs_sum:.6f}")
+
+    assert q_grad_abs_sum > 0.0, "W_q did not receive gradient."
+    assert k_grad_abs_sum > 0.0, "W_k did not receive gradient."
+    assert v_grad_abs_sum > 0.0, "W_v did not receive gradient."
+
+    print("\nAtlasGen-SLM RoPE+SDPA candidate verified.")

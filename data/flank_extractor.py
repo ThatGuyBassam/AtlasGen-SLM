@@ -108,9 +108,17 @@ def extract_flank(ref, valid_chroms, chrom, pos, vcf_ref, alt, flank_size=FLANK_
 
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 
-def extract_flanks_from_vcf(vcf_path, ref, split=None, max_variants=None):
+def extract_flanks_from_vcf(vcf_path, ref, split=None, max_variants=None, stats=None):
     """
     Run the full extraction pipeline for one VCF file.
+
+    stats: optional mutable dict (e.g. {}) that gets updated in-place with
+    "extracted"/"skipped" counts as they happen — BEFORE each yield, not
+    after. This means it stays accurate even if the caller abandons this
+    generator early (e.g. breaks its own consuming loop once it has
+    enough samples), which normally causes a GeneratorExit that skips any
+    code after the internal loop — including the print statement below.
+    Pass a dict in if you need reliable counts in that scenario.
     """
     count   = 0
     skipped = 0
@@ -134,10 +142,16 @@ def extract_flanks_from_vcf(vcf_path, ref, split=None, max_variants=None):
 
         if sequence is None:
             skipped += 1
+            if stats is not None:
+                stats["skipped"] = skipped
+                stats["extracted"] = count
             continue
 
         yield sequence, variant_split
         count += 1
+        if stats is not None:
+            stats["extracted"] = count
+            stats["skipped"] = skipped
 
         if max_variants and count >= max_variants:
             break
